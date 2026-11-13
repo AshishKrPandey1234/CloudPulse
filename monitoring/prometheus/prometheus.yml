@@ -1,0 +1,30 @@
+# ===================================================================
+# Prometheus Server Configuration for CloudPulse
+# ===================================================================
+global:
+  scrape_interval: 10s      # Scrape targets every 10 seconds
+  evaluation_interval: 10s  # Evaluate alert rules every 10 seconds
+  scrape_timeout: 5s
+
+scrape_configs:
+  # -----------------------------------------------------------------
+  # Target 1: CloudPulse Spring Boot Actuator Telemetry
+  # -----------------------------------------------------------------
+  - job_name: 'cloudpulse-app'
+    metrics_path: '/actuator/prometheus'
+    scheme: 'http'
+    static_configs:
+      - targets: ['app:8080']
+        labels:
+          environment: 'production'
+          service: 'cloudpulse-backend'
+          region: 'aws-ec2'
+
+  # -----------------------------------------------------------------
+  # Target 2: Prometheus Internal Metrics
+  # -----------------------------------------------------------------
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+        labels:
+          service: 'prometheus-core'

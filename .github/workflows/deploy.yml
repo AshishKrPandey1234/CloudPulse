@@ -1,0 +1,152 @@
+name: CloudPulse CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+env:
+  DOCKER_IMAGE: ashishkrpandey1234/cloudpulse
+  DEPLOY_PATH: /home/ubuntu/cloudpulse
+
+jobs:
+  # ===================================================================
+  # Job 1: Build & Automated Unit/Integration Testing
+  # ===================================================================
+  test-and-build:
+    name: Test & Build Application
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Repository Code
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'maven'
+
+      - name: Run Unit & Integration Tests
+        run: mvn clean test --batch-mode
+
+      - name: Compile and Package Spring Boot Executable JAR
+        run: mvn clean package -DskipTests --batch-mode
+
+      - name: Archive Test Results (Surefire Reports)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-test-reports
+          path: target/surefire-reports/
+          retention-days: 7
+
+  # ===================================================================
+  # Job 2: Build & Push Multi-Arch Docker Container Image
+  # ===================================================================
+  build-and-push-docker:
+    name: Build & Push Docker Image
+    needs: test-and-build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Repository Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub Registry
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract Docker Image Metadata & Tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_IMAGE }}
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short
+            type=ref,event=branch
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ===================================================================
+  # Job 3: Secure SSH Deployment to AWS EC2
+  # ===================================================================
+  deploy-to-aws-ec2:
+    name: Deploy to AWS EC2 Host
+    needs: build-and-push-docker
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Repository Code
+        uses: actions/checkout@v4
+
+      - name: Synchronize Orchestration & Monitoring Configs to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "docker-compose.yml,init.sql,monitoring/,scripts/"
+          target: ${{ env.DEPLOY_PATH }}
+          overwrite: true
+
+      - name: Execute Remote Deployment via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+            cd ${{ env.DEPLOY_PATH }}
+            chmod +x scripts/*.sh
+            
+            # Export image tag for docker-compose
+            export DOCKER_IMAGE="${{ env.DOCKER_IMAGE }}:latest"
+            
+            # Run production deployment automation
+            ./scripts/deploy.sh
+
+  # ===================================================================
+  # Job 4: Post-Deployment Synthetic Health Verification
+  # ===================================================================
+  synthetic-verification:
+    name: Synthetic Health Check & SLA Verification
+    needs: deploy-to-aws-ec2
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Repository Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Monitor Dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Run Synthetic Probe Against EC2 Endpoint
+        run: |
+          python scripts/health_monitor.py \
+            --host "http://${{ secrets.EC2_HOST }}:8080" \
+            --threshold-ms 1000 \
+            --timeout 10 \
+            --once
